@@ -567,8 +567,14 @@ def test_lora_lru_cache_model_manager(
     assert manager.lora_index_to_id[1] == 1
     assert manager.pin_adapter(3)
     assert manager.pin_adapter(1)
+    assert manager.remove_adapter(2)
+    assert manager.add_adapter(model_lora2)
     with pytest.raises(RuntimeError):
         assert manager.pin_adapter(2)
+    # A failed GPU pin must leave the CPU adapter eligible for eviction.
+    assert manager.remove_oldest_adapter()
+    assert set(manager.list_adapters()) == {1, 3}
+    assert manager.add_adapter(model_lora2)
     assert manager.lora_index_to_id[0] == 3
     assert manager.lora_index_to_id[1] == 1
     with pytest.raises(RuntimeError):

@@ -1412,8 +1412,14 @@ class LRUCacheLoRAModelManager(LoRAModelManager):
 
     def pin_adapter(self, lora_id: int) -> bool:
         """Pin a LoRAModel in the manager cache."""
+        was_cpu_pinned = lora_id in self._registered_adapters.pinned_items
         self._pin_lora_in_cpu_cache(lora_id)
-        self._pin_lora_in_gpu_cache(lora_id)
+        try:
+            self._pin_lora_in_gpu_cache(lora_id)
+        except Exception:
+            if not was_cpu_pinned:
+                self._registered_adapters._unpin(lora_id)
+            raise
         return True
 
     def _pin_lora_in_cpu_cache(self, lora_id: int):
