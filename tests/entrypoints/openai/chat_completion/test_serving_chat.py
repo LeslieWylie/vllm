@@ -3439,3 +3439,61 @@ async def test_non_streaming_finish_reason_matches_tool_calls(
     assert bool(choice.message.tool_calls) == (text != "Hello, how are you?"), (
         "finish_reason must reflect whether tool calls were emitted"
     )
+
+
+@pytest.mark.parametrize("mode", ["auto", "required"])
+def test_allowed_tool_subset_is_resolved_before_generation(mode):
+    tools = [
+        {"type": "function", "function": {"name": name, "parameters": {}}}
+        for name in ("keep", "drop")
+    ]
+    choice = {
+        "type": "allowed_tools",
+        "allowed_tools": {
+            "mode": mode,
+            "tools": [{"type": "function", "function": {"name": "keep"}}],
+        },
+    }
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "Hi"}], tools=tools, tool_choice=choice
+    )
+    assert request.tool_choice == mode
+    assert [tool.function.name for tool in request.tools] == ["keep"]
+    assert len(tools) == 2
+    assert choice["type"] == "allowed_tools"
+
+
+@pytest.mark.parametrize(
+    "names,mode,kwargs,match",
+    [
+        (["missing"], "auto", {}, "allowed_tools"),
+        (["keep", "keep"], "auto", {}, "allowed_tools"),
+        ([""], "auto", {}, "allowed_tools"),
+        ([], "required", {}, "allowed_tools"),
+        (["keep"], "auto", {"chat_template_kwargs": []}, "chat_template_kwargs"),
+        (
+            ["keep"],
+            "auto",
+            {"chat_template_kwargs": {"tool_choice": "required"}},
+            "conflicts",
+        ),
+    ],
+)
+def test_invalid_allowed_tool_subset_is_rejected(names, mode, kwargs, match):
+    with pytest.raises((ValueError, VLLMValidationError), match=match):
+        ChatCompletionRequest(
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[
+                {"type": "function", "function": {"name": "keep", "parameters": {}}}
+            ],
+            tool_choice={
+                "type": "allowed_tools",
+                "allowed_tools": {
+                    "mode": mode,
+                    "tools": [
+                        {"type": "function", "function": {"name": n}} for n in names
+                    ],
+                },
+            },
+            **kwargs,
+        )

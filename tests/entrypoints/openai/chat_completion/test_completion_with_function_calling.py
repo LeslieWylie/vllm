@@ -505,3 +505,25 @@ async def test_max_tokens_with_tool_choice_required(
     choice = chat_completion.choices[0]
     assert choice.finish_reason == "length"
     assert choice.message.tool_calls is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_empty_auto_allowed_tools_uses_text_path(client, stream):
+    response = await client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Hi"}],
+        max_tokens=1,
+        tools=tools,
+        tool_choice={
+            "type": "allowed_tools",
+            "allowed_tools": {"mode": "auto", "tools": []},
+        },
+        stream=stream,
+    )
+    if stream:
+        async for chunk in response:
+            for choice in chunk.choices:
+                assert not choice.delta.tool_calls
+    else:
+        assert response.choices and not response.choices[0].message.tool_calls

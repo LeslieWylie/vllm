@@ -2,6 +2,23 @@
 
 vLLM currently supports named function calling, as well as the `auto`, `required` (as of `vllm>=0.8.3`), and `none` options for the `tool_choice` field in the chat completion API.
 
+## Allowed function subsets
+
+The Python Chat Completions endpoint also accepts a declared function subset:
+
+```json
+{"tool_choice": {"type": "allowed_tools", "allowed_tools": {
+  "mode": "required",
+  "tools": [{"type": "function", "function": {"name": "get_weather"}}]
+}}}
+```
+
+Declare each function in the request's `tools` list. The server filters these
+prompt declarations before rendering, constrained decoding and output parsing,
+then uses the existing `auto` or `required` path. Historical messages are unchanged.
+Duplicate/undeclared names, an empty required subset and conflicting template
+choices are rejected. An empty `auto` subset selects the normal no-tools text path.
+
 ## Quickstart
 
 Start the server with tool calling enabled. This example uses Meta's Llama 3.1 8B model, so we need to use the `llama3_json` tool calling chat template from the vLLM examples directory:

@@ -222,6 +222,21 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
 
 
+class ChatCompletionAllowedToolReference(OpenAIBaseModel):
+    type: Literal["function"]
+    function: ChatCompletionNamedFunction
+
+
+class ChatCompletionAllowedTools(OpenAIBaseModel):
+    mode: Literal["auto", "required"]
+    tools: list[ChatCompletionAllowedToolReference]
+
+
+class ChatCompletionAllowedToolChoiceParam(OpenAIBaseModel):
+    type: Literal["allowed_tools"]
+    allowed_tools: ChatCompletionAllowedTools
+
+
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -252,6 +267,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         | Literal["auto"]
         | Literal["required"]
         | ChatCompletionNamedToolChoiceParam
+        | ChatCompletionAllowedToolChoiceParam
         | None
     ) = "none"
     reasoning_effort: (
@@ -971,6 +987,59 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "Either provide at least one tool or omit the field entirely.",
                 parameter="tools",
             )
+
+        choice = data.get("tool_choice")
+        if isinstance(choice, ChatCompletionAllowedToolChoiceParam) or (
+            isinstance(choice, dict) and choice.get("type") == "allowed_tools"
+        ):
+            choice = ChatCompletionAllowedToolChoiceParam.model_validate(choice)
+            allowed = choice.allowed_tools
+            names = [tool.function.name for tool in allowed.tools]
+            if any(not name for name in names) or len(names) != len(set(names)):
+                raise VLLMValidationError(
+                    "allowed_tools names must be non-empty and unique",
+                    parameter="tool_choice.allowed_tools",
+                )
+            if not data.get("tools"):
+                raise VLLMValidationError(
+                    "When using allowed_tools, tools must be set",
+                    parameter="tools",
+                )
+            declared = [
+                ChatCompletionToolsParam.model_validate(t) for t in data["tools"]
+            ]
+            unknown = set(names) - {tool.function.name for tool in declared}
+            if unknown:
+                raise VLLMValidationError(
+                    "allowed_tools references undeclared functions: "
+                    + ", ".join(sorted(unknown)),
+                    parameter="tool_choice.allowed_tools",
+                )
+            if allowed.mode == "required" and not names:
+                raise VLLMValidationError(
+                    "allowed_tools must not be empty in required mode",
+                    parameter="tool_choice.allowed_tools",
+                )
+            template_kwargs = data.get("chat_template_kwargs")
+            if template_kwargs is not None and not isinstance(template_kwargs, dict):
+                raise VLLMValidationError(
+                    "chat_template_kwargs must be an object",
+                    parameter="chat_template_kwargs",
+                )
+            template_choice = (template_kwargs or {}).get("tool_choice")
+            if template_choice is not None and template_choice != allowed.mode:
+                raise VLLMValidationError(
+                    "chat_template_kwargs.tool_choice conflicts with allowed_tools.mode",
+                    parameter="chat_template_kwargs.tool_choice",
+                )
+            # Resolve once so rendering, constraints and output parsers agree.
+            data = dict(data)
+            data["tools"] = [
+                tool
+                for tool, parsed in zip(data["tools"], declared)
+                if parsed.function.name in names
+            ] or None
+            data["tool_choice"] = allowed.mode if names else "none"
 
         # if "tool_choice" is not specified but tools are provided,
         # default to "auto" tool_choice
