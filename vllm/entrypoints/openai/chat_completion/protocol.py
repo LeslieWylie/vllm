@@ -322,6 +322,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # --8<-- [end:chat-completion-sampling-params]
 
     # --8<-- [start:chat-completion-extra-params]
+    prompt_token_ids: list[Annotated[int, Field(strict=True, ge=0)]] | None = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Final, already-templated prompt token IDs. Skips chat templating "
+            "and tokenization; messages are retained as request metadata. "
+            "Supported for text-only, decoder-only models with HF tokenizers. "
+            "Normal prompt length and truncation limits still apply."
+        ),
+    )
     echo: bool = Field(
         default=False,
         description=(
@@ -1069,6 +1079,38 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def check_prompt_token_ids(cls, data):
+        if not isinstance(data, dict) or data.get("prompt_token_ids") is None:
+            return data
+        if not data.get("messages"):
+            raise VLLMValidationError(
+                "`prompt_token_ids` requires at least one message.",
+                parameter="messages",
+            )
+        if data.get("echo"):
+            raise VLLMValidationError(
+                "`prompt_token_ids` does not support `echo`.",
+                parameter="prompt_token_ids",
+            )
+        if has_non_text_content(data.get("messages")):
+            raise VLLMValidationError(
+                "`prompt_token_ids` only supports text messages.",
+                parameter="prompt_token_ids",
+            )
+        kv_transfer_params = data.get("kv_transfer_params")
+        if (
+            isinstance(kv_transfer_params, dict)
+            and kv_transfer_params.get("prompt_token_ids") is not None
+        ):
+            raise VLLMValidationError(
+                "Cannot combine `prompt_token_ids` with "
+                "`kv_transfer_params['prompt_token_ids']`.",
+                parameter="prompt_token_ids",
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def drop_prompt_token_ids_with_media(cls, data):
         # The forwarded ids would drop media in ``messages``, so ignore them. Runs
         # before validation, which can turn content into a one-shot iterator.
@@ -1218,6 +1260,12 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
             data = data.model_dump(exclude_unset=True)
         if not isinstance(data, dict):
             return data
+        if data.get("prompt_token_ids") is not None:
+            raise VLLMValidationError(
+                "Batch chat completions do not support `prompt_token_ids`: "
+                "one pre-tokenized prompt cannot serve several conversations.",
+                parameter="prompt_token_ids",
+            )
         if data.get("use_beam_search"):
             raise VLLMValidationError(
                 "Batch chat completions do not support beam search. "

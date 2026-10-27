@@ -66,6 +66,134 @@ async def client(server):
 
 
 @pytest.mark.asyncio
+async def test_pretokenized_chat_preserves_prompt_and_output(client):
+    messages = [{"role": "user", "content": "What is 1+1?"}]
+    reference = await client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0,
+        max_completion_tokens=5,
+        extra_body={"return_token_ids": True},
+    )
+    ids = reference.prompt_token_ids
+    assert ids
+    extra_body = {"prompt_token_ids": ids, "return_token_ids": True}
+    # Final IDs are authoritative; messages must not be templated again.
+    metadata = [{"role": "user", "content": "This text is not the prompt."}]
+    result = await client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=metadata,
+        temperature=0,
+        max_completion_tokens=5,
+        extra_body=extra_body,
+    )
+    assert result.prompt_token_ids == ids
+    assert result.choices[0].token_ids == reference.choices[0].token_ids
+    assert result.choices[0].message.content == reference.choices[0].message.content
+    assert result.usage == reference.usage
+
+    stream = await client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=metadata,
+        temperature=0,
+        max_completion_tokens=5,
+        stream=True,
+        stream_options={"include_usage": True},
+        extra_body=extra_body,
+    )
+    chunks = [chunk async for chunk in stream]
+    assert chunks[0].prompt_token_ids == ids
+    assert [
+        token
+        for chunk in chunks
+        for choice in chunk.choices
+        for token in (getattr(choice, "token_ids", None) or [])
+    ] == reference.choices[0].token_ids
+    assert chunks[-1].usage == reference.usage
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["left", "right"])
+async def test_pretokenized_chat_honors_truncation(client, side):
+    ids = [10, 20, 30, 40, 50, 60]
+    result = await client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "metadata"}],
+        temperature=0,
+        max_completion_tokens=1,
+        extra_body={
+            "prompt_token_ids": ids,
+            "truncate_prompt_tokens": 4,
+            "truncation_side": side,
+            "return_token_ids": True,
+        },
+    )
+    assert result.prompt_token_ids == (ids[-4:] if side == "left" else ids[:4])
+    assert result.usage.prompt_tokens == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("ids", [[], [-1], [True], [1.5], [999999999], [1] * 8193])
+async def test_pretokenized_chat_rejects_invalid_ids_before_stream(client, ids, stream):
+    with pytest.raises(openai.BadRequestError):
+        await client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "metadata"}],
+            max_completion_tokens=1,
+            stream=stream,
+            extra_body={"prompt_token_ids": ids},
+        )
+
+
+def test_pretokenized_chat_rejects_echo_media_and_conflicting_ids():
+    messages = [{"role": "user", "content": "metadata"}]
+    for extra in (
+        {"messages": []},
+        {"echo": True},
+        {"kv_transfer_params": {"prompt_token_ids": [1]}},
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "unused"}},
+                    ],
+                }
+            ],
+        },
+    ):
+        with pytest.raises((ValueError, VLLMValidationError), match="prompt_token_ids"):
+            ChatCompletionRequest(
+                **({"messages": messages, "prompt_token_ids": [1]} | extra)
+            )
+    with pytest.raises(VLLMValidationError, match="prompt_token_ids"):
+        BatchChatCompletionRequest(messages=[messages], prompt_token_ids=[1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"messages": [], "add_generation_prompt": False},
+        {"truncate_prompt_tokens": 0},
+    ],
+)
+async def test_pretokenized_chat_rejects_empty_inputs_before_stream(
+    client, stream, extra
+):
+    with pytest.raises(openai.BadRequestError):
+        await client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "metadata"}],
+            max_completion_tokens=1,
+            stream=stream,
+            extra_body={"prompt_token_ids": [1], **extra},
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     # first test base model, then test loras
     "model_name",

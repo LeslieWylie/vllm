@@ -250,6 +250,18 @@ class OnlineRenderer:
         """
         tokenizer = self.renderer.tokenizer
 
+        if request.prompt_token_ids is not None and (
+            self.use_harmony
+            or is_mistral_tokenizer(tokenizer)
+            or self.model_config.is_encoder_decoder
+            or self.model_config.multimodal_config is not None
+        ):
+            raise VLLMValidationError(
+                "`prompt_token_ids` is only supported for text-only, "
+                "decoder-only models with HF tokenizers.",
+                parameter="prompt_token_ids",
+            )
+
         tool_parser = self.parser.tool_parser_cls if self.parser is not None else None
 
         if is_mistral_tokenizer(tokenizer):
@@ -807,13 +819,39 @@ class OnlineRenderer:
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
 
-        reuse_ids = _reused_prompt_token_ids(request, renderer, messages)
-        if reuse_ids:
+        prompt_ids = (
+            request.prompt_token_ids
+            if isinstance(request, ChatCompletionRequest)
+            else None
+        )
+        reuse_ids = (
+            _reused_prompt_token_ids(request, renderer, messages)
+            if prompt_ids is None
+            else None
+        )
+        if prompt_ids is not None:
+            renderer.validate_token_ids(prompt_ids, parameter="prompt_token_ids")
+            conversation: list[ConversationMessage] = []
+            (engine_input,) = await renderer.render_cmpl_async(
+                [TokensPrompt(prompt_token_ids=prompt_ids)],
+                tok_params,
+                prompt_extras={
+                    "cache_salt": getattr(request, "cache_salt", None),
+                },
+                skip_mm_cache=skip_mm_cache,
+            )
+            if not engine_input.get("prompt_token_ids"):
+                raise VLLMValidationError(
+                    "`prompt_token_ids` must contain at least one token "
+                    "after truncation.",
+                    parameter="prompt_token_ids",
+                )
+        elif reuse_ids:
             # Decode-side token reuse: feed the forwarded ids straight to the
             # engine, skipping templating and tokenization. ``messages`` are not
             # tokenized, so conversation is empty. The adjust_request tail below
             # still runs.
-            conversation: list[ConversationMessage] = []
+            conversation = []
             engine_input = tokens_input(
                 reuse_ids, cache_salt=getattr(request, "cache_salt", None)
             )

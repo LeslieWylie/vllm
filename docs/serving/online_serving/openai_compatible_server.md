@@ -192,6 +192,41 @@ The following extra parameters are supported:
     --8<-- "vllm/entrypoints/openai/chat_completion/protocol.py:chat-completion-extra-params"
     ```
 
+#### Pre-tokenized text input
+
+For text-only, decoder-only models with Hugging Face tokenizers, pass the final
+prompt tokens as `extra_body={"prompt_token_ids": ids}`. vLLM skips chat
+templating and input tokenization while retaining the normal Chat Completions
+response, tool/reasoning parsing, usage accounting, and prompt length limits.
+
+```python
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+messages = [{"role": "user", "content": "What is 1+1?"}]
+ids = tokenizer.apply_chat_template(
+    messages, tokenize=True, add_generation_prompt=True,
+)
+response = client.chat.completions.create(
+    model=model_name,
+    messages=messages,
+    extra_body={"prompt_token_ids": ids},
+)
+```
+
+The IDs are authoritative: use the same tokenizer, chat template, and tool
+definitions as the server. `messages` must contain at least one message for
+request metadata and are not rendered into the prompt again. vLLM does not add
+special tokens or apply template options to supplied IDs.
+`truncate_prompt_tokens` and `truncation_side`
+still apply, and `return_prompt_text` is null because no prompt text is rendered.
+
+This input does not support multimodal or encoder-decoder models, Harmony or
+Mistral tokenizers, `echo`, or the batch Chat API. Combining it with
+`kv_transfer_params.prompt_token_ids` is also rejected. IDs must be a non-empty
+list of non-negative integers within the model/tokenizer vocabulary.
+The effective prompt must still contain at least one token after truncation.
+
 ### Responses API
 
 Our Responses API is compatible with [OpenAI's Responses API](https://platform.openai.com/docs/api-reference/responses);
