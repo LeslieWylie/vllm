@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import asyncio
+import json
+import threading
+from contextlib import contextmanager, suppress
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+import aiohttp
 import lm_eval
 import pytest
 
+from . import gsm8k_eval
 from .gsm8k_eval import (
     GSM8K_EVALS_PATH,
     STRICT_MATCH,
@@ -14,7 +19,6 @@ from .gsm8k_eval import (
     _score_gsm8k,
     assert_gsm8k_result,
     assert_min_accuracy,
-    call_vllm_api,
     evaluate_gsm8k_lm_eval,
     get_gsm8k_eval_spec,
     load_gsm8k_eval_specs,
@@ -146,25 +150,97 @@ def test_yaml_spec_validates_profile_metric_and_floor():
         assert_gsm8k_result(wrong_profile, spec)
 
 
-def test_http_errors_fail_evaluation():
-    class FailingRequest:
-        async def __aenter__(self):
-            raise RuntimeError("server unavailable")
+@pytest.fixture
+def gsm8k_http_server(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        gsm8k_eval,
+        "load_gsm8k_data",
+        lambda: ([], [{"question": "1 + 1?", "answer": "#### 2"}]),
+    )
 
-        async def __aexit__(self, *args):
-            return None
+    @contextmanager
+    def serve(body: bytes, *, status: int = 200, stall: bool = False):
+        release = threading.Event()
+        received = []
 
-    class FailingSession:
-        def post(self, *args, **kwargs):
-            return FailingRequest()
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                request = json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"]))
+                )
+                received.append((self.path, request))
+                if stall:
+                    release.wait(timeout=5)
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                # The timeout case has already closed its connection.
+                with suppress(BrokenPipeError, ConnectionResetError):
+                    self.wfile.write(body)
 
-    with pytest.raises(RuntimeError, match="server unavailable"):
-        asyncio.run(
-            call_vllm_api(
-                FailingSession(),
-                prompt="Question: 1 + 1?\nAnswer:",
-                temperature=0.0,
-                max_tokens=16,
-                url="http://localhost:8000",
-            )
+            def log_message(self, format, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
         )
+        thread.start()
+        try:
+            yield server.server_port, received
+        finally:
+            release.set()
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+
+    return serve
+
+
+@pytest.mark.parametrize("chat", [False, True], ids=["completions", "chat"])
+@pytest.mark.parametrize(
+    "failure,error",
+    [
+        ("http", aiohttp.ClientResponseError),
+        ("json", json.JSONDecodeError),
+        ("timeout", TimeoutError),
+    ],
+)
+def test_http_errors_fail_evaluation(gsm8k_http_server, chat, failure, error):
+    """Transport failures must not become wrong answers hidden by accuracy tolerance."""
+    with gsm8k_http_server(
+        b"{", status=500 if failure == "http" else 200, stall=failure == "timeout"
+    ) as (port, received):
+        with pytest.raises(error):
+            gsm8k_eval.evaluate_gsm8k(
+                num_questions=1,
+                num_shots=0,
+                model="test-model",
+                use_chat_completions=chat,
+                port=port,
+                request_timeout_seconds=0.5 if failure == "timeout" else 5,
+            )
+        assert received[0][0] == ("/v1/chat/completions" if chat else "/v1/completions")
+
+
+@pytest.mark.parametrize("chat", [False, True], ids=["completions", "chat"])
+def test_unparseable_http_answer_is_a_scored_result(gsm8k_http_server, chat):
+    """Successful generation without a number is an invalid answer, not an API error."""
+    choice = (
+        {"message": {"content": "No numeric answer"}}
+        if chat
+        else {"text": "No numeric answer"}
+    )
+    body = json.dumps({"choices": [choice], "usage": {"completion_tokens": 3}}).encode()
+    with gsm8k_http_server(body) as (port, _):
+        result = gsm8k_eval.evaluate_gsm8k(
+            num_questions=1,
+            num_shots=0,
+            model="test-model",
+            use_chat_completions=chat,
+            port=port,
+        )
+    assert result.accuracy == 0
+    assert result.invalid_rate == 1
+    assert result.num_questions == 1
+    assert result.total_output_tokens == 3
